@@ -250,13 +250,10 @@ export async function exportToMP4WithFFmpegFrames({
     return blob;
   } finally {
     signal?.removeEventListener('abort', terminateOnAbort);
+    await Promise.allSettled(pendingWrites);
     const ffmpeg = await ffmpegPromise.catch(() => null);
     if (ffmpeg) {
-      await Promise.allSettled([
-        ...frameFiles.map((file) => ffmpeg.deleteFile(file)),
-        ffmpeg.deleteFile(audioFile),
-        ffmpeg.deleteFile(outputFile),
-      ]);
+      await deleteFilesSettled(ffmpeg, [...frameFiles, audioFile, outputFile]);
     }
   }
 }
@@ -336,11 +333,7 @@ export async function exportToMP4(
     outputBlob = blob;
   } finally {
     signal?.removeEventListener('abort', terminateOnAbort);
-    await Promise.allSettled([
-      ...frameFiles.map((file) => ffmpeg.deleteFile(file)),
-      ffmpeg.deleteFile(audioFile),
-      ffmpeg.deleteFile(outputFile),
-    ]);
+    await deleteFilesSettled(ffmpeg, [...frameFiles, audioFile, outputFile]);
   }
   onProgress(1.0);
   if (!outputBlob) {
@@ -483,12 +476,27 @@ async function execFFmpeg(
   try {
     const exitCode = await ffmpeg.exec(args, -1, { signal });
     if (exitCode !== 0) {
-      const detail = logs.length ? `: ${logs.slice(-12).join('\n')}` : '';
-      throw new Error(`FFmpeg ${label} encode exited with code ${exitCode}${detail}`);
+      throw new Error(`exited with code ${exitCode}`);
     }
+  } catch (err) {
+    const detail = formatFFmpegLogDetail(logs);
+    throw new Error(`FFmpeg ${label} encode failed: ${getErrorMessage(err)}${detail}`);
   } finally {
     ffmpeg.off('log', onLog);
   }
+}
+
+async function deleteFilesSettled(ffmpeg: FFmpegType, files: string[]) {
+  const chunkSize = 64;
+  for (let start = 0; start < files.length; start += chunkSize) {
+    await Promise.allSettled(
+      files.slice(start, start + chunkSize).map((file) => ffmpeg.deleteFile(file)),
+    );
+  }
+}
+
+function formatFFmpegLogDetail(logs: string[]) {
+  return logs.length ? `:\n${logs.slice(-12).join('\n')}` : '';
 }
 
 function assertValidMP4(rawData: Uint8Array | string) {
@@ -554,6 +562,7 @@ function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
   const numChannels = buffer.numberOfChannels;
   const sampleRate = buffer.sampleRate;
   const length = buffer.length;
+  const channelData = Array.from({ length: numChannels }, (_, ch) => buffer.getChannelData(ch));
   const arrayBuffer = new ArrayBuffer(44 + length * numChannels * 2);
   const view = new DataView(arrayBuffer);
 
@@ -578,13 +587,33 @@ function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
   view.setUint32(40, length * numChannels * 2, true);
 
   let offset = 44;
-  for (let i = 0; i < length; i++) {
-    for (let ch = 0; ch < numChannels; ch++) {
-      const sample = Math.max(-1, Math.min(1, buffer.getChannelData(ch)[i]));
-      view.setInt16(offset, sample * 0x7fff, true);
+  if (numChannels === 1) {
+    const mono = channelData[0];
+    for (let i = 0; i < length; i++) {
+      view.setInt16(offset, floatToInt16(mono[i] ?? 0), true);
       offset += 2;
+    }
+  } else if (numChannels === 2) {
+    const left = channelData[0];
+    const right = channelData[1];
+    for (let i = 0; i < length; i++) {
+      view.setInt16(offset, floatToInt16(left[i] ?? 0), true);
+      view.setInt16(offset + 2, floatToInt16(right[i] ?? 0), true);
+      offset += 4;
+    }
+  } else {
+    for (let i = 0; i < length; i++) {
+      for (let ch = 0; ch < numChannels; ch++) {
+        view.setInt16(offset, floatToInt16(channelData[ch][i] ?? 0), true);
+        offset += 2;
+      }
     }
   }
 
   return arrayBuffer;
+}
+
+function floatToInt16(value: number) {
+  const sample = Math.max(-1, Math.min(1, value));
+  return sample < 0 ? sample * 0x8000 : sample * 0x7fff;
 }

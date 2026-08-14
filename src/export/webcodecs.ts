@@ -10,9 +10,10 @@ interface WebCodecsExportOptions {
   signal?: AbortSignal;
 }
 
-const VIDEO_CODEC = 'avc1.42001f';
 const AUDIO_CODEC = 'mp4a.40.2';
 const AUDIO_CHUNK_SIZE = 65536;
+const AAC_SAMPLES_PER_FRAME = 1024;
+const AUDIO_CHUNK_HEADROOM = 8;
 const MAX_VIDEO_QUEUE_SIZE = 96;
 const PROGRESS_FRAME_INTERVAL = 45;
 
@@ -20,7 +21,9 @@ export function canUseWebCodecsMP4() {
   return typeof VideoEncoder !== 'undefined'
     && typeof VideoFrame !== 'undefined'
     && typeof AudioEncoder !== 'undefined'
-    && typeof AudioData !== 'undefined';
+    && typeof AudioData !== 'undefined'
+    && typeof VideoEncoder.isConfigSupported === 'function'
+    && typeof AudioEncoder.isConfigSupported === 'function';
 }
 
 export async function exportToMP4WithWebCodecs({
@@ -48,7 +51,7 @@ export async function exportToMP4WithWebCodecs({
     },
     fastStart: {
       expectedVideoChunks: totalFrames,
-      expectedAudioChunks: Math.ceil(audioBuffer.length / AUDIO_CHUNK_SIZE),
+      expectedAudioChunks: getExpectedAudioChunks(audioBuffer),
     },
   });
 
@@ -187,26 +190,14 @@ async function configureEncoders(
   fps: number,
   audioBuffer: AudioBuffer,
 ) {
-  const videoBaseConfig: VideoEncoderConfig = {
-    codec: VIDEO_CODEC,
+  const videoBaseConfig: Omit<VideoEncoderConfig, 'codec'> = {
     width,
     height,
     bitrate: Math.min(12_000_000, Math.max(4_000_000, width * height * fps * 0.16)),
     framerate: fps,
     avc: { format: 'avc' },
   };
-  const videoConfigs: VideoEncoderConfig[] = [{
-    ...videoBaseConfig,
-    hardwareAcceleration: 'prefer-hardware',
-    latencyMode: 'realtime',
-  }, {
-    ...videoBaseConfig,
-    hardwareAcceleration: 'no-preference',
-    latencyMode: 'realtime',
-  }, {
-    ...videoBaseConfig,
-    latencyMode: 'quality',
-  }];
+  const videoConfigs = createVideoConfigCandidates(videoBaseConfig, width, height, fps);
   const audioConfig: AudioEncoderConfig = {
     codec: AUDIO_CODEC,
     sampleRate: audioBuffer.sampleRate,
@@ -225,6 +216,66 @@ async function configureEncoders(
 
   videoEncoder.configure(supportedVideoConfig);
   audioEncoder.configure(audioSupport.config ?? audioConfig);
+}
+
+function createVideoConfigCandidates(
+  baseConfig: Omit<VideoEncoderConfig, 'codec'>,
+  width: number,
+  height: number,
+  fps: number,
+) {
+  return getAvcCodecCandidates(width, height, fps).flatMap((codec): VideoEncoderConfig[] => [{
+    ...baseConfig,
+    codec,
+    hardwareAcceleration: 'prefer-hardware',
+    latencyMode: 'realtime',
+  }, {
+    ...baseConfig,
+    codec,
+    hardwareAcceleration: 'no-preference',
+    latencyMode: 'realtime',
+  }, {
+    ...baseConfig,
+    codec,
+    latencyMode: 'quality',
+  }]);
+}
+
+function getAvcCodecCandidates(width: number, height: number, fps: number) {
+  const level = getAvcLevelHex(width, height, fps);
+  const fallbackLevel = level === '1f' ? '28' : '1f';
+  return [
+    `avc1.4200${level}`,
+    `avc1.4d00${level}`,
+    `avc1.6400${level}`,
+    `avc1.4200${fallbackLevel}`,
+    `avc1.4d00${fallbackLevel}`,
+    `avc1.6400${fallbackLevel}`,
+  ];
+}
+
+function getAvcLevelHex(width: number, height: number, fps: number) {
+  const macroblocksPerFrame = Math.ceil(width / 16) * Math.ceil(height / 16);
+  const macroblocksPerSecond = macroblocksPerFrame * fps;
+  const levels = [
+    { hex: '1f', maxFrame: 3600, maxSecond: 108000 },
+    { hex: '28', maxFrame: 8192, maxSecond: 245760 },
+    { hex: '2a', maxFrame: 8704, maxSecond: 522240 },
+    { hex: '32', maxFrame: 22080, maxSecond: 589824 },
+    { hex: '33', maxFrame: 36864, maxSecond: 983040 },
+    { hex: '34', maxFrame: 36864, maxSecond: 2073600 },
+  ];
+  return levels.find((level) =>
+    macroblocksPerFrame <= level.maxFrame && macroblocksPerSecond <= level.maxSecond,
+  )?.hex ?? '34';
+}
+
+function getExpectedAudioChunks(audioBuffer: AudioBuffer) {
+  const inputChunks = Math.ceil(audioBuffer.length / AUDIO_CHUNK_SIZE);
+  // AAC encoders may emit one chunk per 1024-sample AAC frame, plus a few
+  // priming/drain chunks during flush. mp4-muxer expects an upper bound here.
+  const aacFrames = Math.ceil(audioBuffer.length / AAC_SAMPLES_PER_FRAME);
+  return Math.max(inputChunks, aacFrames) + AUDIO_CHUNK_HEADROOM;
 }
 
 async function getSupportedVideoConfig(configs: VideoEncoderConfig[]) {
@@ -298,8 +349,33 @@ async function waitForVideoQueue(
     } else if (performance.now() - lastQueueChangeAt > 15_000) {
       throw new Error(`Video encoder stalled with ${encoder.encodeQueueSize} frames queued`);
     }
-    await yieldToBrowser();
+    await waitForEncoderDequeue(encoder, signal);
   }
+}
+
+function waitForEncoderDequeue(encoder: VideoEncoder, signal?: AbortSignal): Promise<void> {
+  if (encoder.encodeQueueSize <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let timeoutId = 0;
+    const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      encoder.removeEventListener('dequeue', onDequeue);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const finish = () => {
+      cleanup();
+      resolve();
+    };
+    const onDequeue = () => finish();
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException('Export was canceled', 'AbortError'));
+    };
+
+    encoder.addEventListener('dequeue', onDequeue, { once: true });
+    signal?.addEventListener('abort', onAbort, { once: true });
+    timeoutId = window.setTimeout(finish, 50);
+  });
 }
 
 function yieldToBrowser(): Promise<void> {
