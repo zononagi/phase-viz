@@ -136,7 +136,7 @@ Licensed under the [MIT License](LICENSE).
 
 Created by **Nagisa Dozono (TRAJECTORIES)**.
 
-- [GitHub: @zononagi](https://github.com/7g3n)
+- [GitHub: @zononagi](https://github.com/zononagi)
 - [X: @nagisa7g](https://x.com/nagisa7g)
 - [Live demo](https://waveform.tranjectories.xyz/)
 - [Music video created with the visualizer](https://www.youtube.com/watch?v=R8ItWr2V_ZA)
